@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+from calendar import monthrange
 from fractions import Fraction
 from typing import Optional
 
@@ -14,7 +15,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from . import __version__
-from .alloc import SIM_DAYS, AllocationError, allocate
+from .alloc import (SIM_DAYS, AllocationError, allocate, allocate_suffix)
 from .storage import DayRow, StorageError, Store
 
 DB_PATH = os.environ.get("RAIN_DB_PATH", "/data/rain.db")
@@ -104,6 +105,7 @@ class TableOut(BaseModel):
     sim_total: int
     table_total: int
     sealed_through: int
+    sealed_amount: int
     note: Optional[str]
     created_at: str
     days: list[DayOut]
@@ -139,6 +141,7 @@ def _build_table_out(version: int) -> TableOut:
         calendar_days=len(rows), sim_total=meta.sim_total,
         table_total=sum(r.amount for r in rows),
         sealed_through=store.sealed_through(version),
+        sealed_amount=store.sealed_amount(version),
         note=meta.note, created_at=meta.created_at,
         days=_rows_to_days(rows),
     )
@@ -164,16 +167,10 @@ def health() -> dict:
 
 @app.post("/convert", tags=["write"], response_model=TableOut,
           status_code=201,
-          summary="初始转换：模拟月 -> 公历日表，生成现行版本")
+          summary="初始转换：模拟月 -> 公历日表，生成未封存的现行版本")
 def convert(req: ConvertRequest) -> TableOut:
-    cur = store.get_current()
-    if cur is not None and (cur.year, cur.month) != (req.year, req.month):
-        raise HTTPException(
-            409,
-            f"库中现行版本属于 {cur.year}-{cur.month:02d}，"
-            f"不能直接改写为 {req.year}-{req.month:02d}；"
-            "本服务按单站单月版本线运作，请使用新数据库或联系管理员",
-        )
+    # 每次调用都生成一份新的、未封存的日表；年月相同也照常新建版本，
+    # 既有版本及其封存保持不变（仍可用 version 参数按版查询）。
     try:
         result = allocate(req.year, req.month, req.sim_rain, req.approved)
         v = store.write_new_version(
@@ -190,41 +187,41 @@ def convert(req: ConvertRequest) -> TableOut:
 
 
 @app.post("/seal", tags=["write"],
-          summary="封存现行版本从月初到指定日的结果")
+          summary="封存现行版本从上次封存日之后到指定日的结果")
 def seal(req: SealRequest) -> dict:
     cur = store.get_current()
     if cur is None:
         raise HTTPException(409, "尚无现行版本，无法封存")
-    rows = store.list_days(cur.version)
-    if req.through_day > len(rows):
+    calendar_days = monthrange(cur.year, cur.month)[1]
+    if not 1 <= req.through_day <= calendar_days:
         raise HTTPException(
             422,
-            f"封存日 {req.through_day} 超出该月日历天数 {len(rows)}",
+            f"封存日 {req.through_day} 超出该月日历天数 {calendar_days}",
         )
+    prev_through = store.sealed_through(cur.version)
+    # 只读本次新增封存段（属于现行版自身保存的后缀），不遍历封存链。
+    rows = store.own_days(cur.version, after_day=prev_through,
+                          through_day=req.through_day)
     try:
         info = store.seal_current(req.through_day)
     except StorageError as exc:
         raise HTTPException(409, str(exc)) from exc
-    info["sealed_amount"] = sum(
-        r.amount for r in rows if r.day <= req.through_day
-    )
     info["days"] = [
-        {"day": r.day, "amount": r.amount, "source": r.source}
-        for r in rows if r.day <= req.through_day
+        {"day": r.day, "amount": r.amount, "source": r.source} for r in rows
     ]
     return info
 
 
 @app.post("/recompute", tags=["write"], response_model=TableOut,
           status_code=201,
-          summary="补报/更正：仅限未封存日，重算并保留封存值")
+          summary="补报/更正：仅限未封存日，重算后缀并继承封存前缀")
 def recompute(req: RecomputeRequest) -> TableOut:
     cur = store.get_current()
     if cur is None:
         raise HTTPException(409, "尚无现行版本，请先调用 /convert")
     base_no = cur.version
     seal_through = store.sealed_through(base_no)
-    base_rows = store.list_days(base_no)
+    seal_amount = store.sealed_amount(base_no)
 
     touched = sorted(req.approved)
     locked = [d for d in touched if d <= seal_through]
@@ -236,41 +233,24 @@ def recompute(req: RecomputeRequest) -> TableOut:
         )
 
     sim_rain = tuple(req.sim_rain) if req.sim_rain is not None else cur.sim_rain
-    # 合并核准信息：基版全部核准日 + 本次补报/更正（未封存日允许覆盖）。
-    approved = {r.day: r.amount for r in base_rows if r.source == "approved"}
+    # 只继承未封存日的既有核准信息；封存前缀的日值与来源由封存链原样保留。
+    approved = {
+        r.day: r.amount for r in store.own_days(base_no, after_day=seal_through)
+        if r.source == "approved"
+    }
     approved.update(req.approved)
 
-    # 封存日以整数核准方式钉住，确保重算数值原样保留；来源标签稍后还原。
-    base_source = {r.day: r.source for r in base_rows}
-    base_amount = {r.day: r.amount for r in base_rows}
-    for day, amount in base_amount.items():
-        if day <= seal_through:
-            approved[day] = amount
-
     try:
-        result = allocate(cur.year, cur.month, sim_rain, approved)
-        fixed_rows = []
-        for r in result.rows:
-            if r.day <= seal_through:
-                if r.amount != base_amount[r.day]:
-                    raise AllocationError(
-                        f"重算改动了已封存日 {r.day} 的值，拒绝写入"
-                    )
-                # 封存只冻结数值，不改变其“核准/估算”的原始来源
-                fixed_rows.append(r.__class__(
-                    day=r.day, amount=r.amount,
-                    source=base_source[r.day], exact=r.exact))
-            else:
-                fixed_rows.append(r)
-        result = result.__class__(
-            year=result.year, month=result.month,
-            calendar_days=result.calendar_days, sim_total=result.sim_total,
-            approved_total=result.approved_total, rows=tuple(fixed_rows))
+        result = allocate_suffix(
+            cur.year, cur.month, sim_rain, approved,
+            sealed_through=seal_through, sealed_amount=seal_amount,
+        )
+        # 只写未封存后缀；封存前缀通过 seal_head_id 继承，不复制、不重写。
         new_no = store.add_version_from(
             base_no, sim_rain=sim_rain, sim_total=result.sim_total,
             rows=_result_to_day_rows(result),
             note=f"补报/更正，本次变更日 {touched}，封存至第 {seal_through} 日",
-            seal_through=seal_through,
+            seal_head_id=cur.seal_head_id,
         )
     except AllocationError as exc:
         raise HTTPException(422, f"无解：{exc}") from exc
@@ -296,19 +276,62 @@ def get_table(version: Optional[int] = None,
     return out
 
 
-@app.get("/versions", tags=["read"], summary="列出版本线与封存情况")
-def list_versions() -> dict:
+@app.get("/versions", tags=["read"],
+         summary="列出版本线与封存情况；可按版直接查封存记录")
+def list_versions(version: Optional[int] = None,
+                  include_seals: bool = False) -> dict:
+    """版本线；``version`` 指定只看该版，``include_seals=true`` 附带封存明细。
+
+    封存明细直接取自该版的封存链表头，返回**原封存记录编号**、截止日与
+    封存时间，无需沿补报历史逐版回找。
+    """
     current = store.current_version_no()
+    metas = store.list_versions()
+    if version is not None:
+        metas = [m for m in metas if m.version == version]
+        if not metas:
+            raise HTTPException(404, f"版本 {version} 不存在")
     items = []
-    for m in store.list_versions():
-        items.append({
+    for m in metas:
+        item = {
             "version": m.version, "year": m.year, "month": m.month,
             "sim_total": m.sim_total, "created_at": m.created_at,
             "note": m.note,
             "sealed_through": store.sealed_through(m.version),
+            "sealed_amount": store.sealed_amount(m.version),
             "is_current": m.version == current,
-        })
+        }
+        if include_seals:
+            item["seals"] = store.list_seals(m.version)
+        items.append(item)
     return {"current_version": current, "versions": items}
+
+
+@app.get("/seals", tags=["read"],
+         summary="按版直接查封存记录（原封存编号 / 截止日 / 封存时间）")
+def get_seals(version: Optional[int] = None) -> dict:
+    """取某一版的有效封存记录，缺省取现行版。
+
+    记录直接来自该版的封存表头（一次主键查询），返回**原封存记录编号**、
+    截止日与封存时间；继承自前序版本的记录保留其原始编号，无需沿补报历史
+    逐版回找，读取量与版本数、日记录数无关。
+    """
+    no = version if version is not None else store.current_version_no()
+    if no is None:
+        raise HTTPException(404, "尚无任何版本，请先调用 /convert")
+    meta = store.get_version(no)
+    if meta is None:
+        raise HTTPException(404, f"版本 {no} 不存在")
+    seals = store.list_seals(no)
+    return {
+        "version": no,
+        "year": meta.year,
+        "month": meta.month,
+        "sealed_through": store.sealed_through(no),
+        "sealed_amount": store.sealed_amount(no),
+        "count": len(seals),
+        "seals": seals,
+    }
 
 
 @app.get("/cumulative", tags=["read"],
@@ -324,14 +347,15 @@ def cumulative(through_day: int, version: Optional[int] = None) -> dict:
     if not 1 <= through_day <= len(rows):
         raise HTTPException(422, f"through_day 须在 1..{len(rows)} 之间")
     part = [r for r in rows if r.day <= through_day]
+    seal_through = store.sealed_through(no)
     return {
         "version": no,
         "year": meta.year,
         "month": meta.month,
         "through_day": through_day,
         "cumulative_amount": sum(r.amount for r in part),
-        "sealed_through": store.sealed_through(no),
-        "is_sealed": through_day <= store.sealed_through(no),
+        "sealed_through": seal_through,
+        "is_sealed": through_day <= seal_through,
         "breakdown": [
             {"day": r.day, "amount": r.amount, "source": r.source}
             for r in part

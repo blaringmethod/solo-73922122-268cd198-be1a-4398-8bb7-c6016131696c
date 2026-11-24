@@ -89,3 +89,49 @@ def test_bad_inputs():
         allocate(2026, 1, [-1] + [0] * 29, {})
     with pytest.raises(AllocationError):
         allocate(2026, 1, [0] * SIM_DAYS, {32: 1})
+
+
+# ---------------- 封存后缀重算 ----------------
+from app.alloc import allocate_suffix  # noqa: E402
+
+SIM = [3, 0, 7, 11, 25, 1, 0, 9, 4, 40,
+       2, 6, 8, 0, 13, 5, 5, 100, 0, 2,
+       7, 7, 3, 0, 1, 9, 12, 30, 0, 6]
+
+
+@pytest.mark.parametrize("year,month", [(2026, 1), (2026, 2), (2024, 2), (2026, 4)])
+def test_suffix_zero_seal_equals_full_allocate(year, month):
+    appr = {2: 10}
+    full = allocate(year, month, SIM, appr)
+    suffix = allocate_suffix(year, month, SIM, appr,
+                             sealed_through=0, sealed_amount=0)
+    assert [r.amount for r in suffix.rows] == [r.amount for r in full.rows]
+    assert [r.source for r in suffix.rows] == [r.source for r in full.rows]
+
+
+def test_suffix_matches_full_with_pinned_prefix():
+    # 先用整月算法得到前缀值，再把前缀当作封存快照重算后缀
+    base = allocate(2026, 1, SIM, {2: 10})
+    k = 12
+    sealed_amount = sum(r.amount for r in base.rows[:k])
+    suffix = allocate_suffix(2026, 1, SIM, {20: 15},
+                             sealed_through=k, sealed_amount=sealed_amount)
+    assert suffix.rows[0].day == k + 1
+    # 对照：整月算法把前缀逐日钉为核准
+    pinned = {r.day: r.amount for r in base.rows[:k]}
+    pinned[20] = 15
+    full = allocate(2026, 1, SIM, pinned)
+    assert [r.amount for r in suffix.rows] == \
+           [r.amount for r in full.rows[k:]]
+
+
+def test_suffix_rejects_approved_inside_seal():
+    with pytest.raises(AllocationError, match="未封存范围"):
+        allocate_suffix(2026, 1, SIM, {3: 1}, sealed_through=5,
+                        sealed_amount=10)
+
+
+def test_suffix_infeasible_when_remaining_over_total():
+    with pytest.raises(AllocationError):
+        allocate_suffix(2026, 1, [1] * SIM_DAYS, {10: 10},
+                        sealed_through=5, sealed_amount=25)

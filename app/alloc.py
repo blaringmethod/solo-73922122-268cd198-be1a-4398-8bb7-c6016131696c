@@ -172,6 +172,120 @@ def allocate(year: int, month: int, sim_rain: Sequence[int],
     return result
 
 
+def allocate_suffix(year: int, month: int, sim_rain: Sequence[int],
+                    approved: Mapping[int, int], *,
+                    sealed_through: int, sealed_amount: int
+                    ) -> AllocationResult:
+    """在已有封存前缀之上，只重算未封存后缀（补报/更正用）。
+
+    封存前缀的逐日值由封存链继承、不重算也不读出；这里只用到它的两个
+    不变量：截止日 ``sealed_through`` 与整数累计量 ``sealed_amount``。
+    由于封存前缀的精确累计恰为整数 ``sealed_amount``（前缀取整误差为 0），
+    后缀沿用同一“平移向下取整”即可，结果与整月 :func:`allocate` 完全一致，
+    任意区间误差仍严格小于 1。``approved`` 只允许落在未封存日。
+
+    返回结果只含第 ``sealed_through + 1`` 日起的日值。
+    """
+    if len(sim_rain) != SIM_DAYS:
+        raise AllocationError(f"模拟日雨量必须恰为 {SIM_DAYS} 个，收到 {len(sim_rain)} 个")
+    if any(v < 0 for v in sim_rain):
+        raise AllocationError("模拟日雨量必须为非负整数")
+    cal_days = monthrange(year, month)[1]
+    if not 0 <= sealed_through <= cal_days:
+        raise AllocationError(f"封存截止日 {sealed_through} 超出日历范围")
+    if sealed_amount < 0:
+        raise AllocationError("封存累计量必须为非负整数")
+    if any(v < 0 for v in approved.values()):
+        raise AllocationError("核准雨量必须为非负整数")
+    bad = [d for d in approved
+           if not 1 <= d <= cal_days or d <= sealed_through]
+    if bad:
+        raise AllocationError(
+            f"核准日必须落在未封存范围内（{sealed_through + 1}..{cal_days}）: "
+            f"{sorted(bad)}"
+        )
+
+    sim_total = sum(sim_rain)
+    approved_total = sum(approved.values())
+    remaining = sim_total - sealed_amount - approved_total
+    if remaining < 0:
+        raise AllocationError(
+            f"封存累计量 {sealed_amount} 与核准量 {approved_total} 之和"
+            f"超过模拟月总量 {sim_total}，无解"
+        )
+
+    raw = _raw_exact_shares(sim_rain, cal_days)
+    free_days = [d for d in range(sealed_through, cal_days)
+                 if (d + 1) not in approved]
+    weight_sum = sum(raw[d] for d in free_days)
+    if remaining > 0 and weight_sum == 0:
+        raise AllocationError(
+            "剩余月量大于 0，但所有未核准日的重叠权重均为 0，无解"
+        )
+
+    rows: list[DayShare] = []
+    prev_floor = sealed_amount  # 封存前缀累计恰为整数，取整误差为 0
+    cum_exact = Fraction(sealed_amount)
+    for d in range(sealed_through, cal_days):
+        day_no = d + 1
+        if day_no in approved:
+            ex = Fraction(approved[day_no])
+        elif weight_sum > 0:
+            ex = Fraction(remaining) * raw[d] / weight_sum
+        else:
+            ex = Fraction(0)
+        cum_exact += ex
+        cur_floor = cum_exact.numerator // cum_exact.denominator
+        amount = cur_floor - prev_floor
+        if amount < 0:  # 数学上不可能，防御性检查
+            raise AllocationError("内部错误：取整出现负值")
+        rows.append(DayShare(
+            day=day_no, amount=amount,
+            source="approved" if day_no in approved else "estimated",
+            exact=ex,
+        ))
+        prev_floor = cur_floor
+
+    if cum_exact != sim_total:
+        raise AllocationError("内部错误：精确份额总量与模拟值不一致")
+
+    result = AllocationResult(
+        year=year, month=month, calendar_days=cal_days,
+        sim_total=sim_total, approved_total=approved_total,
+        rows=tuple(rows),
+    )
+    _verify_suffix(result, sealed_amount)
+    return result
+
+
+def _verify_suffix(result: AllocationResult, sealed_amount: int) -> None:
+    """后缀终检：非负、核准保留、总量守恒、封存边界起任意区间误差 <1。"""
+    total = sealed_amount + result.total
+    if total != result.sim_total:
+        raise AllocationError("内部错误：整月总量与模拟值不一致")
+    for r in result.rows:
+        if r.amount < 0:
+            raise AllocationError("内部错误：日表出现负值")
+        if r.source == "approved" and r.amount != r.exact:
+            raise AllocationError("内部错误：核准日值被取整改动")
+    # 封存边界的取整误差为 0，区间误差 = e_b - e_(a-1)。
+    prefix_err: list[Fraction] = [Fraction(0)]
+    cum_exact = Fraction(0)
+    cum_round = 0
+    for r in result.rows:
+        cum_exact += r.exact
+        cum_round += r.amount
+        prefix_err.append(cum_round - cum_exact)
+    for hi in range(1, len(prefix_err)):
+        for lo in range(hi):
+            err = prefix_err[hi] - prefix_err[lo]
+            if not (abs(err) < 1):
+                raise AllocationError(
+                    f"内部错误：封存后区间 [{lo + 1}, {hi}] "
+                    f"累计误差 {err} 不小于 1"
+                )
+
+
 def _verify(result: AllocationResult, exact: Sequence[Fraction]) -> None:
     """对成品日表做守恒与任意区间误差严格 <1 的终检。"""
     if result.total != result.sim_total:
